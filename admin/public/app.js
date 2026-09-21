@@ -212,47 +212,62 @@ $('#new-device').addEventListener('click', () => { $('#device-modal').hidden = f
 $('#close-device').addEventListener('click', () => { $('#device-modal').hidden = true; });
 $('#device-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const body = Object.fromEntries(new FormData(event.currentTarget));
-  try { await request('/api/admin/devices', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); event.currentTarget.reset(); $('#device-modal').hidden = true; await refresh(); }
-  catch (error) { $('#notice').textContent = error.message; $('#notice').hidden = false; }
+  const form = event.currentTarget;
+  const body = Object.fromEntries(new FormData(form));
+  try {
+    await request('/api/admin/devices', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    form?.reset?.();
+    $('#device-modal').hidden = true;
+    await refresh();
+  } catch (error) { $('#notice').textContent = error.message; $('#notice').hidden = false; }
 });
 $('#new-rule').addEventListener('click', () => { $('#rule-modal').hidden = false; $('#rule-form').elements.name.focus(); });
 $('#close-rule').addEventListener('click', () => { $('#rule-modal').hidden = true; });
 $('#rule-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const body = Object.fromEntries(new FormData(event.currentTarget));
+  const form = event.currentTarget;
+  const body = Object.fromEntries(new FormData(form));
   body.priority = Number(body.priority);
   if (!body.tag) delete body.tag;
-  try { await request('/api/admin/rules', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); event.currentTarget.reset(); $('#rule-modal').hidden = true; await refreshGovernance(); }
-  catch (error) { $('#notice').textContent = error.message; $('#notice').hidden = false; }
+  try {
+    await request('/api/admin/rules', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    form?.reset?.();
+    $('#rule-modal').hidden = true;
+    await refreshGovernance();
+  } catch (error) { $('#notice').textContent = error.message; $('#notice').hidden = false; }
 });
 $('#simulate-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const body = Object.fromEntries(new FormData(event.currentTarget));
-  try { const result = await request('/api/admin/policy/simulate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ targetId: $('#simulate-device').value, action: body.action }) }); $('#simulate-output').textContent = JSON.stringify(result, null, 2); }
-  catch (error) { $('#simulate-output').textContent = error.message; }
+  const form = event.currentTarget;
+  const body = Object.fromEntries(new FormData(form));
+  try {
+    const result = await request('/api/admin/policy/simulate', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ targetId: $('#simulate-device').value, action: body.action }) });
+    $('#simulate-output').textContent = JSON.stringify(result, null, 2);
+  } catch (error) { $('#simulate-output').textContent = error.message; }
 });
 $('#refresh-activity').addEventListener('click', refreshActivity);
 $('#export-audit').addEventListener('click', () => { window.location.assign('/api/admin/audit/export'); });
 $('#run-retention').addEventListener('click', async (event) => {
-  event.currentTarget.disabled = true;
+  const btn = event.currentTarget;
+  btn.disabled = true;
   try {
     const result = await request('/api/admin/retention/run', { method: 'POST' });
     $('#notice').textContent = `保留清理完成：${JSON.stringify(result)}`;
     $('#notice').hidden = false;
     await refreshActivity();
   } catch (error) { $('#notice').textContent = error.message; $('#notice').hidden = false; }
-  finally { event.currentTarget.disabled = false; }
+  finally { btn.disabled = false; }
 });
 $('#login-form').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const body = Object.fromEntries(new FormData(event.currentTarget));
+  const form = event.currentTarget;
+  const body = Object.fromEntries(new FormData(form));
   try {
     const session = await request('/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
     state.csrfToken = session.csrfToken;
     $('#current-user').textContent = session.user.displayName || session.user.username;
     $('#login-screen').hidden = true;
-    event.currentTarget.reset();
+    form?.reset?.();
     refresh();
   } catch (error) { showLogin(error.message); }
 });
