@@ -1,0 +1,20 @@
+{
+  "name": "rustdesk-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "description": "RustDesk official communication services with a lightweight admin console",
+  "scripts": {
+    "start": "node admin/server.js",
+    "build:server": "cargo build --release --manifest-path vendor/rustdesk-server/Cargo.toml",
+    "test": "node --test admin/*.test.js",
+    "test:postgres": "TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54329/rustdesk_control_test node --test admin/postgres.test.js",
+    "backup": "bash admin/backup.sh",
+    "restore": "bash admin/restore.sh"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

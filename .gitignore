@@ -1,0 +1,14 @@
+node_modules/
+admin/runtime/
+admin/backups/
+backups/
+data/
+vendor/*/target/
+vendor/*/.env.local
+*.log
+.env
+.env.*
+!*.env.example
+*.dump
+*.backup
+.DS_Store
