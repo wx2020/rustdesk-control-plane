@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const http = require('node:http');
 process.env.ADMIN_PASSWORD = 'test-admin-password';
 process.env.ADMIN_USERNAME = 'test-admin';
 process.env.ADMIN_ALLOW_MEMORY_STORE = 'Y';
@@ -327,3 +328,102 @@ test('accepts a rolling policy token and exports audited cleanup operations', as
     else process.env.ADMIN_LOGIN_RATE_LIMIT = previousLoginRateLimit;
   }
 });
+
+test('handles OAuth discovery, login redirection, and callback authentication', async (t) => {
+  const mockAuthelia = http.createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/api/oidc/token') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ access_token: 'auth-test-token', id_token: 'mock.id.token' }));
+      });
+      return;
+    }
+    if (req.method === 'GET' && req.url === '/api/oidc/userinfo') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        sub: 'authelia-sub-001',
+        preferred_username: 'authelia_sso_user',
+        name: 'Authelia SSO User',
+        email: 'sso@example.com',
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((resolve) => mockAuthelia.listen(0, '127.0.0.1', resolve));
+  t.after(() => mockAuthelia.close());
+  const autheliaPort = mockAuthelia.address().port;
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+
+  const configBefore = await fetch(`http://127.0.0.1:${server.address().port}/api/auth/config`);
+  assert.equal(configBefore.status, 200);
+  const cfgJson = await configBefore.json();
+  assert.equal(cfgJson.oauth.enabled, false);
+
+  const disabledLogin = await fetch(`http://127.0.0.1:${server.address().port}/api/auth/oauth/login`, { redirect: 'manual' });
+  assert.equal(disabledLogin.status, 404);
+
+  process.env.OAUTH_ENABLED = 'Y';
+  process.env.OAUTH_CLIENT_ID = 'test-client';
+  process.env.OAUTH_CLIENT_SECRET = 'test-secret';
+  process.env.OAUTH_AUTH_URL = `http://127.0.0.1:${autheliaPort}/api/oidc/authorization`;
+  process.env.OAUTH_TOKEN_URL = `http://127.0.0.1:${autheliaPort}/api/oidc/token`;
+  process.env.OAUTH_USERINFO_URL = `http://127.0.0.1:${autheliaPort}/api/oidc/userinfo`;
+
+  try {
+    const configAfter = await fetch(`http://127.0.0.1:${server.address().port}/api/auth/config`);
+    const cfgAfterJson = await configAfter.json();
+    assert.equal(cfgAfterJson.oauth.enabled, true);
+    assert.equal(cfgAfterJson.oauth.providerName, 'Authelia');
+
+    const loginRes = await fetch(`http://127.0.0.1:${server.address().port}/api/auth/oauth/login`, { redirect: 'manual' });
+    assert.equal(loginRes.status, 302);
+    const location = loginRes.headers.get('location');
+    assert.ok(location.startsWith(`http://127.0.0.1:${autheliaPort}/api/oidc/authorization?`));
+    const stateCookieHeader = loginRes.headers.get('set-cookie');
+    assert.match(stateCookieHeader, /rd_oauth_state=/);
+
+    const parsedLoc = new URL(location);
+    const state = parsedLoc.searchParams.get('state');
+    assert.ok(state);
+
+    const badStateRes = await fetch(`http://127.0.0.1:${server.address().port}/api/auth/oauth/callback?code=mock-code&state=wrong-state`, {
+      redirect: 'manual',
+      headers: { cookie: stateCookieHeader.split(';')[0] },
+    });
+    assert.equal(badStateRes.status, 302);
+    assert.match(badStateRes.headers.get('location'), /\/\?oauth_error=invalid_state/);
+
+    const successRes = await fetch(`http://127.0.0.1:${server.address().port}/api/auth/oauth/callback?code=mock-code&state=${state}`, {
+      redirect: 'manual',
+      headers: { cookie: stateCookieHeader.split(';')[0] },
+    });
+    assert.equal(successRes.status, 302);
+    assert.equal(successRes.headers.get('location'), '/');
+
+    const cookies = successRes.headers.get('set-cookie');
+    assert.match(cookies, /rd_admin_session=/);
+    const sessionCookiePart = cookies.split(',').find((c) => c.includes('rd_admin_session=')).trim().split(';')[0];
+
+    const meRes = await fetch(`http://127.0.0.1:${server.address().port}/api/auth/me`, {
+      headers: { cookie: sessionCookiePart },
+    });
+    assert.equal(meRes.status, 200);
+    const meJson = await meRes.json();
+    assert.equal(meJson.user.username, 'authelia_sso_user');
+    assert.equal(meJson.user.displayName, 'Authelia SSO User');
+  } finally {
+    delete process.env.OAUTH_ENABLED;
+    delete process.env.OAUTH_CLIENT_ID;
+    delete process.env.OAUTH_CLIENT_SECRET;
+    delete process.env.OAUTH_AUTH_URL;
+    delete process.env.OAUTH_TOKEN_URL;
+    delete process.env.OAUTH_USERINFO_URL;
+  }
+});
+

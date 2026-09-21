@@ -60,10 +60,18 @@ npm start
 | `RETENTION_CLEANUP_INTERVAL_HOURS` | `24` | 自动保留清理间隔小时数 |
 | `CONTROL_PLANE_CACHE_TTL` | `5` | 改造版服务端策略决策缓存秒数 |
 | `CONTROL_PLANE_CIRCUIT_OPEN_FOR` | `15` | 连续策略失败后熔断打开秒数 |
+| `OAUTH_ENABLED` | `N` | `Y` 时启用 OAuth 2.0 / OIDC 单点登录 |
+| `OAUTH_PROVIDER_NAME` | `Authelia` | 前端登录按钮显示的身份源名称 |
+| `OAUTH_ISSUER` | 未设置 | OIDC 提供商 Issuer URL（如 `https://auth.example.com`） |
+| `OAUTH_CLIENT_ID` | 未设置 | OAuth 客户端 ID |
+| `OAUTH_CLIENT_SECRET` | 未设置 | OAuth 客户端密钥 |
+| `OAUTH_REDIRECT_URI` | 自动推导 | 回调地址，默认 `https://<domain>/api/auth/oauth/callback` |
+| `OAUTH_AUTO_CREATE_USER` | `Y` | 初次登录的 OAuth 用户是否自动建档 |
+| `OAUTH_DEFAULT_ROLE_ID` | `role_admin` | 自动建档用户的初始角色 ID |
 
 管理后台不会执行任意 shell 命令。控制台输入会被限制为单条命令，并通过 `127.0.0.1` 连接官方服务的控制端口。
 
-管理 API 使用本地管理员登录、HttpOnly SameSite 会话 Cookie 和 CSRF Token 保护。生产环境必须设置 `DATABASE_URL` 与 `ADMIN_PASSWORD`；使用反向代理时应终结 HTTPS 并设置 `ADMIN_COOKIE_SECURE=Y`。PostgreSQL 结构通过 `admin/migrations/` 的版本化迁移管理，已应用版本保存在 `schema_migrations` 表；`admin/schema.sql` 只保留为早期结构参考。
+管理 API 支持本地管理员登录、OAuth 2.0 / OIDC 单点登录（详见 [docs/AUTHENTICATION-OAUTH.md](docs/AUTHENTICATION-OAUTH.md)）以及反向代理身份透传，并通过 HttpOnly SameSite 会话 Cookie 和 CSRF Token 保护。生产环境必须设置 `DATABASE_URL` 与 `ADMIN_PASSWORD`；使用反向代理时应终结 HTTPS 并设置 `ADMIN_COOKIE_SECURE=Y`。PostgreSQL 结构通过 `admin/migrations/` 的版本化迁移管理，已应用版本保存在 `schema_migrations` 表；`admin/schema.sql` 只保留为早期结构参考。
 
 控制面提供 `GET /healthz` 健康检查，以及受管理员会话保护的 `GET /metrics` Prometheus 文本指标；配置 `METRICS_TOKEN` 后可使用 Bearer Token 抓取。管理员会话保存于 PostgreSQL，可在多个控制面实例间共享。完整的部署、备份恢复、密钥与 Token 轮换流程见 `docs/OPERATIONS-RUNBOOK.md`。
 

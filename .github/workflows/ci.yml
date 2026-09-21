@@ -7,11 +7,27 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
-  test-and-lint:
-    name: Node Test & Patch Hygiene
+  test-and-verify:
+    name: Full Stack Test (Server, Postgres, WebUI)
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: rustdesk_control_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 54329:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,8 +37,36 @@ jobs:
         with:
           node-version: 22
 
-      - name: Run control plane tests
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run all control plane tests (Unit, OAuth, PostgreSQL integration)
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54329/rustdesk_control_test
         run: npm test
+
+      - name: Verify Web UI static assets and runtime launch
+        run: |
+          ADMIN_PORT=3000 ADMIN_PASSWORD=test-admin-ci ADMIN_ALLOW_MEMORY_STORE=Y npm start &
+          SERVER_PID=$!
+          sleep 3
+          
+          echo "Verifying / (Web UI HTML)..."
+          curl -s -f http://127.0.0.1:3000/ | grep -q "RustDesk"
+          
+          echo "Verifying /styles.css..."
+          curl -s -f http://127.0.0.1:3000/styles.css | grep -q "oauth"
+          
+          echo "Verifying /app.js..."
+          curl -s -f http://127.0.0.1:3000/app.js | grep -q "loadAuthConfig"
+          
+          echo "Verifying /api/auth/config..."
+          curl -s -f http://127.0.0.1:3000/api/auth/config | grep -q "oauth"
+          
+          echo "Verifying /healthz..."
+          curl -s -f http://127.0.0.1:3000/healthz | grep -q "ok"
+          
+          kill $SERVER_PID
 
       - name: Verify patch apply dry-run
         run: npm run sync:server:apply -- --dry-run
@@ -30,8 +74,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cargo check on patched server
+      - name: Cargo check on patched Rust server
         env:
           DATABASE_URL: sqlite://${{ github.workspace }}/vendor/rustdesk-server/db_v2.sqlite3
         run: cargo check --manifest-path vendor/rustdesk-server/Cargo.toml
-

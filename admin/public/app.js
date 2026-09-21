@@ -19,7 +19,42 @@ function showLogin(error = '') {
   $('#login-error').hidden = !error;
 }
 
+async function loadAuthConfig() {
+  try {
+    const config = await request('/api/auth/config');
+    if (config.oauth && config.oauth.enabled) {
+      $('#oauth-container').hidden = false;
+      const name = config.oauth.providerName || 'Authelia';
+      $('#oauth-btn-text').textContent = `通过 ${name} 登录`;
+      $('#login-subtitle').textContent = `使用 ${name} 单点登录或本地管理员账号访问控制面。`;
+    } else {
+      $('#oauth-container').hidden = true;
+      $('#login-subtitle').textContent = '使用本地管理员账号访问控制面。';
+    }
+  } catch {
+    // ignore
+  }
+}
+
 async function initialize() {
+  await loadAuthConfig();
+
+  const params = new URLSearchParams(window.location.search);
+  const oauthError = params.get('oauth_error');
+  if (oauthError) {
+    const errorMap = {
+      user_disabled: '该账号已被停用，请联系管理员。',
+      user_not_found: '该用户未在控制面登记，请联系管理员分配账号。',
+      invalid_state: '单点登录校验失效或已超时，请重试。',
+      oauth_disabled: '未启用 OAuth 单点登录。',
+      rate_limited: '单点登录尝试过于频繁，请稍后再试。',
+    };
+    const msg = errorMap[oauthError] || `单点登录失败: ${oauthError}`;
+    window.history.replaceState({}, document.title, window.location.pathname);
+    showLogin(msg);
+    return;
+  }
+
   try {
     const session = await request('/api/auth/me');
     state.csrfToken = session.csrfToken;

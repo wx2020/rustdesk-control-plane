@@ -2,9 +2,11 @@ const http = require('node:http');
 const net = require('node:net');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { createStore } = require('./store');
 const { AuthService, sessionCookie, expiredCookie } = require('./auth');
+const { OAuthService } = require('./oauth');
 const { FixedWindowLimiter, Metrics, redact, remoteAddress } = require('./observability');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -45,6 +47,7 @@ const processes = new Map();
 const logs = new Map();
 const store = createStore();
 const auth = new AuthService(store);
+const oauth = new OAuthService();
 const metrics = new Metrics();
 const limiter = new FixedWindowLimiter();
 let retentionTimer;
@@ -488,6 +491,23 @@ function text(res, status, body, headers = {}) {
   res.end(body);
 }
 
+function redirect(res, location, cookies = []) {
+  const headers = {
+    location,
+    'cache-control': 'no-store',
+  };
+  if (cookies.length) headers['set-cookie'] = cookies;
+  res.writeHead(302, headers);
+  res.end();
+}
+
+function resolveRedirectUri(req) {
+  if (process.env.OAUTH_REDIRECT_URI) return process.env.OAUTH_REDIRECT_URI;
+  const proto = req.headers['x-forwarded-proto'] || (secureCookie(req) ? 'https' : 'http');
+  const host = req.headers['x-forwarded-host'] || req.headers.host || `${HOST}:${PORT}`;
+  return `${proto}://${host}/api/auth/oauth/callback`;
+}
+
 function csvValue(value) {
   return `"${String(value ?? '').replace(/"/g, '""')}"`;
 }
@@ -566,6 +586,111 @@ async function handleApi(req, res, url) {
   if (req.method === 'GET' && url.pathname === '/api/auth/me') {
     const session = await auth.session(req);
     return session ? json(res, 200, { user: session.user, csrfToken: session.csrfToken }) : json(res, 401, { error: '需要登录' });
+  }
+  if (req.method === 'GET' && url.pathname === '/api/auth/config') {
+    return json(res, 200, {
+      oauth: oauth.getPublicConfig(),
+      proxyAuth: Boolean(process.env.ADMIN_PROXY_AUTH_TRUST === 'Y' && process.env.ADMIN_TRUST_PROXY === 'Y'),
+    });
+  }
+  if (req.method === 'GET' && url.pathname === '/api/auth/oauth/login') {
+    if (!oauth.isEnabled()) {
+      return json(res, 404, { error: '未启用 OAuth 单点登录' });
+    }
+    const rateLimit = limiter.allow('oauth_login', remoteAddress(req), numberFromEnv('ADMIN_LOGIN_RATE_LIMIT', 10), 60_000);
+    if (!rateLimit.allowed) {
+      metrics.increment('rustdesk_control_plane_rate_limited_total', { scope: 'oauth_login' });
+      return redirect(res, '/?oauth_error=rate_limited');
+    }
+    try {
+      const redirectUri = resolveRedirectUri(req);
+      const { url: authUrl, state, codeVerifier } = await oauth.getAuthorizationUrl(redirectUri);
+      const cookie = oauth.packStateCookie(state, codeVerifier, secureCookie(req));
+      return redirect(res, authUrl, [cookie]);
+    } catch (error) {
+      return redirect(res, `/?oauth_error=${encodeURIComponent(error.message)}`);
+    }
+  }
+  if (req.method === 'GET' && url.pathname === '/api/auth/oauth/callback') {
+    if (!oauth.isEnabled()) {
+      return redirect(res, '/?oauth_error=oauth_disabled');
+    }
+    const errorParam = url.searchParams.get('error_description') || url.searchParams.get('error');
+    if (errorParam) {
+      return redirect(res, `/?oauth_error=${encodeURIComponent(errorParam)}`);
+    }
+    const code = url.searchParams.get('code') || '';
+    const state = url.searchParams.get('state') || '';
+    const cookieData = oauth.unpackStateCookie(req);
+    if (!cookieData || !state || cookieData.state !== state) {
+      return redirect(res, '/?oauth_error=invalid_state', [oauth.expiredStateCookie(secureCookie(req))]);
+    }
+    try {
+      const redirectUri = resolveRedirectUri(req);
+      const profile = await oauth.exchangeCode({
+        code,
+        state,
+        expectedState: cookieData.state,
+        codeVerifier: cookieData.codeVerifier,
+        redirectUri,
+      });
+
+      let user = await store.getUserByUsername(profile.username);
+      if (!user) {
+        if (!oauth.isAutoCreateUser()) {
+          return redirect(res, '/?oauth_error=user_not_found', [oauth.expiredStateCookie(secureCookie(req))]);
+        }
+        user = await store.create('users', {
+          username: profile.username,
+          displayName: profile.displayName,
+          roleId: oauth.getDefaultRoleId(),
+          disabled: false,
+        });
+        await store.audit({
+          actor: profile.username,
+          action: 'oauth_user_provisioned',
+          resourceType: 'user',
+          resourceId: user.id,
+          details: { provider: oauth.getProviderName(), email: profile.email },
+        });
+      }
+
+      if (user.disabled) {
+        return redirect(res, '/?oauth_error=user_disabled', [oauth.expiredStateCookie(secureCookie(req))]);
+      }
+
+      const role = user.roleId ? await store.get('roles', user.roleId) : null;
+      const sessionId = crypto.randomBytes(32).toString('base64url');
+      const csrfToken = crypto.randomBytes(24).toString('base64url');
+      const session = {
+        id: sessionId,
+        csrfToken,
+        user: {
+          id: user.id,
+          username: user.username,
+          displayName: user.displayName,
+          permissions: role ? role.permissions || [] : user.permissions || [],
+        },
+        expiresAt: Date.now() + 8 * 60 * 60 * 1000,
+      };
+      await store.saveAdminSession(session);
+      await store.audit({
+        actor: user.username,
+        action: 'oauth_login',
+        resourceType: 'auth',
+        resourceId: user.id,
+        details: { provider: oauth.getProviderName() },
+      });
+
+      metrics.increment('rustdesk_control_plane_auth_attempts_total', { result: 'succeeded' });
+      return redirect(res, '/', [
+        sessionCookie(session.id, secureCookie(req)),
+        oauth.expiredStateCookie(secureCookie(req)),
+      ]);
+    } catch (error) {
+      metrics.increment('rustdesk_control_plane_auth_attempts_total', { result: 'failed' });
+      return redirect(res, `/?oauth_error=${encodeURIComponent(error.message)}`, [oauth.expiredStateCookie(secureCookie(req))]);
+    }
   }
   if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
     const check = await auth.authorize(req, 'services.manage', true);
@@ -678,4 +803,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { server, serviceDefinitions, serviceState, readConfig, startService, stopService, sendConsole, auth, runRetentionCleanup };
+module.exports = { server, serviceDefinitions, serviceState, readConfig, startService, stopService, sendConsole, auth, oauth, runRetentionCleanup };

@@ -13,14 +13,14 @@
 
 ## 当前基线
 
-- 控制面：Node.js 20+，独立 PostgreSQL 数据库，版本化 migration。
+- 控制面：Node.js 20+，独立 PostgreSQL 数据库，版本化 migration；支持本地管理员认证、OAuth 2.0 / OIDC (Authelia) 单点登录与反向代理身份透传。
 - 通信面：官方 RustDesk `hbbs/hbbr` 加入本仓库策略、事件和 Relay 断开静态代码。
 - 客户端：不修改 RustDesk 客户端。
-- 当前验证：`npm test` 通过 14 项 Node 控制面测试；没有 `TEST_DATABASE_URL` 时，PostgreSQL 集成测试套件跳过。
+- 当前验证：`npm test` 通过 19 项 Node 控制面测试（含 OAuth PKCE、发现与回调认证套件）；没有 `TEST_DATABASE_URL` 时，PostgreSQL 集成测试套件跳过。
 - 当前环境阻塞：没有 `cargo`、`rustc` 或 Docker，未执行 PostgreSQL、Rust 构建、服务启动及官方客户端互操作验证。
 - 架构边界：在不修改客户端的前提下，不能可靠提供源设备到目标设备 ACL、直连会话完整生命周期/流量统计，或断开已建立的直连会话。
 
-已实现但尚未完成目标验证的能力统一标记为 `[~]`：PostgreSQL migration 与 CRUD、`hbbs/hbbr` 策略接入、策略缓存/熔断/重试、Relay 生命周期和 `disconnect <sessionKey>`。
+已实现但尚未完成目标验证的能力统一标记为 `[~]`：PostgreSQL migration 与 CRUD、`hbbs/hbbr` 策略接入、策略缓存/熔断/重试、Relay 生命周期和 `disconnect <sessionKey>`、Authelia 生产端到端 SSO。
 
 ## P0：发布阻塞验证与安全部署
 
