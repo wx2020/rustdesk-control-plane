@@ -1,0 +1,13 @@
+{
+  "name": "RustDesk Control Plane",
+  "forwardPorts": [3000],
+  "portsAttributes": {
+    "3000": {
+      "label": "RustDesk Web Console",
+      "onAutoForward": "openBrowser",
+      "visibility": "public"
+    }
+  },
+  "postCreateCommand": "npm install",
+  "postStartCommand": "docker compose -f docker-compose.test.yml up -d && (ADMIN_PORT=3000 ADMIN_PASSWORD=admin ADMIN_ALLOW_MEMORY_STORE=Y npm start &)"
+}
