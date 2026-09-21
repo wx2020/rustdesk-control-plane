@@ -125,7 +125,9 @@ P1 开始前，P0.1、P0.2 和 P0.3 必须均为 `[V]`。P1 项完成后应达�
 - `[ ]` 只有协议层具备相应能力后，评估直连断开、带宽策略和客户端扩展。
 
 ## 持续维护
-
+ 
+- `[~]` 建立 `vendor/rustdesk-server` 上游同步流水线：基于 `.upstream-rev` 与 `patches/rustdesk-server/0001-control-plane-policy.patch`，通过 `scripts/sync-server.js` 实现版本感知、冲突探测（`npm run sync:server:apply -- --dry-run`）和 Patch 导出（`npm run sync:server:export`）。
 - `[ ]` 每次同步 `vendor/rustdesk-server`：记录上游提交与补丁，重新执行 P0.2 和受支持客户端版本验证。
 - `[ ]` 每季度执行一次 PostgreSQL 恢复演练和 Token 轮换演练，确认 RPO/RTO 与审计证据。
 - `[ ]` 每次发布前复核 RustDesk 上游 AGPL-3.0 义务与本项目新增 MIT 代码边界。
+

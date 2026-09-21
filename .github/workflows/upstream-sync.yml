@@ -1,0 +1,160 @@
+name: Upstream Sync & PR Automation
+
+on:
+  schedule:
+    # 每周一 UTC 00:00 (北京时间 08:00) 自动探测并同步上游
+    - cron: '0 0 * * 1'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '目标上游版本 Tag 或 Commit (留空则默认同步上游 master 最新 HEAD)'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: '仅预演 (Dry-Run: 检查补丁兼容性与编译，不修改代码，不创建 PR)'
+        required: false
+        default: false
+        type: boolean
+      create_pr:
+        description: '验证通过后自动创建 Pull Request'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  sync-and-pr:
+    name: Sync Upstream & Create PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check upstream version difference
+        id: check
+        run: node scripts/sync-server.js check
+
+      - name: Determine if sync is required
+        id: decision
+        run: |
+          HAS_UPDATE="${{ steps.check.outputs.has_update }}"
+          TARGET_INPUT="${{ inputs.target }}"
+          IS_DISPATCH="${{ github.event_name == 'workflow_dispatch' }}"
+          
+          if [ -n "$TARGET_INPUT" ]; then
+            echo "should_sync=true" >> $GITHUB_OUTPUT
+            echo "target_ref=$TARGET_INPUT" >> $GITHUB_OUTPUT
+          elif [ "$IS_DISPATCH" = "true" ]; then
+            echo "should_sync=true" >> $GITHUB_OUTPUT
+            echo "target_ref=${{ steps.check.outputs.target_commit }}" >> $GITHUB_OUTPUT
+          elif [ "$HAS_UPDATE" = "true" ]; then
+            echo "should_sync=true" >> $GITHUB_OUTPUT
+            echo "target_ref=${{ steps.check.outputs.target_commit }}" >> $GITHUB_OUTPUT
+          else
+            echo "should_sync=false" >> $GITHUB_OUTPUT
+            echo "target_ref=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Apply upstream sync & patch
+        if: steps.decision.outputs.should_sync == 'true'
+        id: sync
+        run: |
+          TARGET="${{ steps.decision.outputs.target_ref }}"
+          DRY_RUN="${{ inputs.dry_run }}"
+          if [ "$DRY_RUN" = "true" ]; then
+            node scripts/sync-server.js apply --target="$TARGET" --dry-run
+          else
+            node scripts/sync-server.js apply --target="$TARGET"
+          fi
+
+      - name: Setup Rust toolchain
+        if: steps.decision.outputs.should_sync == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo check on patched server
+        if: steps.decision.outputs.should_sync == 'true'
+        run: cargo check --manifest-path vendor/rustdesk-server/Cargo.toml
+
+      - name: Install Node dependencies
+        if: steps.decision.outputs.should_sync == 'true'
+        run: npm ci || npm install --package-lock-only
+
+      - name: Run control plane tests
+        if: steps.decision.outputs.should_sync == 'true'
+        run: npm test
+
+      - name: Detect changes
+        if: steps.decision.outputs.should_sync == 'true' && inputs.dry_run != true
+        id: git_status
+        run: |
+          if [ -n "$(git status --porcelain vendor/rustdesk-server)" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        if: steps.decision.outputs.should_sync == 'true' && steps.git_status.outputs.has_changes == 'true' && (inputs.create_pr != false)
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(upstream): sync rustdesk-server to ${{ steps.decision.outputs.target_ref }}"
+          branch: "upstream-sync/${{ steps.decision.outputs.target_ref }}"
+          delete-branch: true
+          title: "chore(upstream): 同步 rustdesk-server 至 ${{ steps.decision.outputs.target_ref }}"
+          body: |
+            ## 🤖 自动化上游同步 PR
+            
+            本 PR 由 GitHub Actions 工作流自动化生成。
+            
+            ### 变更信息
+            - **目标上游**: `https://github.com/rustdesk/rustdesk-server.git`
+            - **基准目标**: `${{ steps.decision.outputs.target_ref }}`
+            - **更新目录**: `vendor/rustdesk-server/`
+            - **元数据更新**: `vendor/rustdesk-server/.upstream-rev`
+            
+            ### 自动化验证门禁
+            - [x] 补丁应用校验 (`git apply --check`)：无合并冲突
+            - [x] Rust 服务端编译 (`cargo check`)：编译通过
+            - [x] Node 控制面测试 (`npm test`)：14 项测试全部通过
+            
+            ### 合并前人工检查 Checklist
+            - [ ] 检查 `rendezvous_server.rs` 与 `relay_server.rs` 钩子是否契合上游最新改动
+            - [ ] 隔离环境进行客户端端到端联调验证
+            - [ ] 确认符合 AGPL-3.0 披露要求
+          labels: |
+            upstream-sync
+            automated-pr
+
+      - name: Create Conflict Issue on Failure
+        if: failure() && steps.decision.outputs.should_sync == 'true' && inputs.dry_run != true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const target = '${{ steps.decision.outputs.target_ref }}';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `⚠️ [上游同步冲突] rustdesk-server ${target} 自动打补丁失败`,
+              body: `### 🚨 上游同步自动化告警
+              
+              自动化同步工作流在尝试将上游版本 \`${target}\` 应用本仓库策略补丁时发生冲突或编译失败。
+              
+              - 触发方式: \`${context.eventName}\`
+              - 运行日志: [查看 GitHub Actions 运行记录](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})
+              
+              请开发人员参考 [docs/OPERATIONS-RUNBOOK.md](docs/OPERATIONS-RUNBOOK.md) 第 9 节进行人工冲突消解与补丁导出 (\`npm run sync:server:export\`)。`,
+              labels: ['upstream-sync', 'conflict']
+            });

@@ -1,0 +1,491 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 8da29a2..212b8d0 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,4 +1,5 @@
+ mod rendezvous_server;
++pub mod policy;
+ pub use rendezvous_server::*;
+ pub mod common;
+ mod database;
+diff --git a/src/policy.rs b/src/policy.rs
+new file mode 100644
+index 0000000..d7e918b
+--- /dev/null
++++ b/src/policy.rs
+@@ -0,0 +1,188 @@
++use serde::{Deserialize, Serialize};
++use std::{collections::HashMap, sync::Arc, time::{Duration, Instant}};
++use hbb_common::tokio::{sync::Mutex, time::sleep};
++
++#[derive(Clone)]
++pub struct PolicyClient {
++    client: Option<reqwest::Client>,
++    check_url: String,
++    event_url: String,
++    token: Option<String>,
++    enforce: bool,
++    cache_ttl: Duration,
++    circuit_open_for: Duration,
++    state: Arc<Mutex<PolicyState>>,
++}
++
++struct CacheEntry { decision: PolicyDecision, expires_at: Instant }
++struct PolicyState { cache: HashMap<String, CacheEntry>, failures: u8, circuit_until: Option<Instant> }
++
++#[derive(Clone)]
++pub struct PolicyDecision { pub allowed: bool, pub force_relay: bool }
++
++#[derive(Clone, Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct CheckRequest<'a> {
++    target_id: &'a str,
++    action: &'a str,
++    source_ip: &'a str,
++}
++
++#[derive(Debug, Deserialize)]
++struct CheckResponse {
++    allowed: bool,
++    #[serde(default, rename = "forceRelay")]
++    force_relay: bool,
++}
++
++#[derive(Debug, Serialize)]
++#[serde(rename_all = "camelCase")]
++struct EventRequest {
++    event_id: String,
++    event_type: String,
++    target_id: String,
++    session_key: Option<String>,
++    source_ip: String,
++    details: String,
++}
++
++impl PolicyClient {
++    pub fn from_env() -> Self {
++        let base = crate::common::get_arg("CONTROL_PLANE_URL")
++            .trim_end_matches('/')
++            .to_owned();
++        let token = crate::common::get_arg("CONTROL_PLANE_TOKEN");
++        let enforce = matches!(
++            crate::common::get_arg("CONTROL_PLANE_ENFORCE")
++                .to_ascii_uppercase()
++                .as_str(),
++            "Y" | "YES" | "TRUE" | "1"
++        );
++        let cache_ttl = Duration::from_secs(crate::common::get_arg("CONTROL_PLANE_CACHE_TTL").parse().unwrap_or(5));
++        let circuit_open_for = Duration::from_secs(crate::common::get_arg("CONTROL_PLANE_CIRCUIT_OPEN_FOR").parse().unwrap_or(15));
++        let client = if base.is_empty() {
++            None
++        } else {
++            reqwest::Client::builder()
++                .timeout(Duration::from_millis(800))
++                .build()
++                .ok()
++        };
++        if !base.is_empty() {
++            log::info!(
++                "control plane policy: enabled={}, fail_open={}",
++                client.is_some(),
++                !enforce
++            );
++        }
++        Self {
++            client,
++            check_url: format!("{base}/api/policy/check"),
++            event_url: format!("{base}/api/policy/events"),
++            token: (!token.is_empty()).then_some(token),
++            enforce,
++            cache_ttl,
++            circuit_open_for,
++            state: Arc::new(Mutex::new(PolicyState { cache: HashMap::new(), failures: 0, circuit_until: None })),
++        }
++    }
++
++    pub async fn allow(&self, target_id: &str, action: &str, source_ip: &str) -> bool {
++        self.decision(target_id, action, source_ip).await.allowed
++    }
++
++    pub async fn decision(&self, target_id: &str, action: &str, source_ip: &str) -> PolicyDecision {
++        let Some(client) = &self.client else {
++            return PolicyDecision { allowed: true, force_relay: false };
++        };
++        let cache_key = format!("{target_id}:{action}");
++        {
++            let mut state = self.state.lock().await;
++            if let Some(entry) = state.cache.get(&cache_key) {
++                if entry.expires_at > Instant::now() { return entry.decision.clone(); }
++            }
++            state.cache.retain(|_, entry| entry.expires_at > Instant::now());
++            if matches!(state.circuit_until, Some(until) if until > Instant::now()) {
++                log::warn!("control plane circuit open for {}", cache_key);
++                return PolicyDecision { allowed: !self.enforce, force_relay: false };
++            }
++        }
++        let request = client.post(&self.check_url).json(&CheckRequest {
++            target_id,
++            action,
++            source_ip,
++        });
++        let request = if let Some(token) = &self.token {
++            request.bearer_auth(token)
++        } else {
++            request
++        };
++        let result = match request.send().await {
++            Ok(response) if response.status().is_success() => response.json::<CheckResponse>().await.map(|decision| PolicyDecision { allowed: decision.allowed, force_relay: decision.force_relay }).map_err(|error| error.to_string()),
++            Ok(response) => Err(format!("HTTP {}", response.status())),
++            Err(error) => Err(error.to_string()),
++        };
++        match result {
++            Ok(decision) => {
++                let mut state = self.state.lock().await;
++                state.failures = 0;
++                state.circuit_until = None;
++                state.cache.insert(cache_key, CacheEntry { decision: decision.clone(), expires_at: Instant::now() + self.cache_ttl });
++                decision
++            }
++            Err(reason) => self.failure(reason).await,
++        }
++    }
++
++    pub fn event(&self, event_type: &str, target_id: &str, source_ip: &str, details: &str) {
++        self.event_with_session(event_type, target_id, source_ip, details, None);
++    }
++
++    pub fn event_with_session(
++        &self,
++        event_type: &str,
++        target_id: &str,
++        source_ip: &str,
++        details: &str,
++        session_key: Option<&str>,
++    ) {
++        let Some(client) = self.client.clone() else {
++            return;
++        };
++        let url = self.event_url.clone();
++        let token = self.token.clone();
++        let request = EventRequest {
++            event_id: session_key
++                .map(|key| format!("{key}:{event_type}"))
++                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
++            event_type: event_type.to_owned(),
++            target_id: target_id.to_owned(),
++            session_key: session_key.map(str::to_owned),
++            source_ip: source_ip.to_owned(),
++            details: details.to_owned(),
++        };
++        tokio::spawn(async move {
++            for attempt in 1..=3 {
++                let mut call = client.post(&url).json(&request);
++                if let Some(token) = &token { call = call.bearer_auth(token); }
++                if let Ok(response) = call.send().await {
++                    if response.status().is_success() { return; }
++                    log::debug!("control plane event attempt {} failed: HTTP {}", attempt, response.status());
++                }
++                if attempt < 3 { sleep(Duration::from_millis(100 * attempt)).await; }
++            }
++            log::warn!("control plane event dropped after retries: {}", request.event_id);
++        });
++    }
++
++    async fn failure(&self, reason: String) -> PolicyDecision {
++        log::warn!("control plane policy request failed: {}", reason);
++        let mut state = self.state.lock().await;
++        state.failures = state.failures.saturating_add(1);
++        if state.failures >= 3 {
++            state.circuit_until = Some(Instant::now() + self.circuit_open_for);
++            state.failures = 0;
++        }
++        PolicyDecision { allowed: !self.enforce, force_relay: false }
++    }
++}
+diff --git a/src/relay_server.rs b/src/relay_server.rs
+index de1a7ea..85c87a5 100644
+--- a/src/relay_server.rs
++++ b/src/relay_server.rs
+@@ -1,4 +1,5 @@
+ use async_speed_limit::Limiter;
++use crate::policy::PolicyClient;
+ use async_trait::async_trait;
+ use hbb_common::{
+     allow_err, bail,
+@@ -35,6 +36,7 @@ lazy_static::lazy_static! {
+     static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
+     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
+     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
++    static ref TERMINATED: RwLock<HashSet<String>> = Default::default();
+ }
+ 
+ static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66
+@@ -52,6 +54,7 @@ pub async fn start_with_bind(
+     key: &str,
+ ) -> ResultType<()> {
+     let key = get_server_sk(key);
++    let policy = PolicyClient::from_env();
+     if let Ok(mut file) = std::fs::File::open(BLACKLIST_FILE) {
+         let mut contents = String::new();
+         if file.read_to_string(&mut contents).is_ok() {
+@@ -94,6 +97,7 @@ pub async fn start_with_bind(
+                 crate::common::listen_tcp(bind_addr, port2).await?,
+                 crate::common::listen_console(bind_addr, port).await?,
+                 &key,
++                &policy,
+             )
+             .await;
+         }
+@@ -167,7 +171,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
+     match fds.next() {
+         Some("h") => {
+             res = format!(
+-                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
++                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                 "blacklist-add(ba) <ip>",
+                 "blacklist-remove(br) <ip>",
+                 "blacklist(b) <ip>",
+@@ -179,6 +183,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
+                 "limit-speed(ls) [value(Mb/s)]",
+                 "total-bandwidth(tb) [value(Mb/s)]",
+                 "single-bandwidth(sb) [value(Mb/s)]",
++                "disconnect(d) <relay-uuid>",
+                 "usage(u)"
+             )
+         }
+@@ -328,6 +333,12 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
+                 );
+             }
+         }
++        Some("disconnect" | "d") => {
++            if let Some(session_key) = fds.next() {
++                TERMINATED.write().await.insert(session_key.to_owned());
++                res = "queued\n".to_owned();
++            }
++        }
+         _ => {}
+     }
+     res
+@@ -338,6 +349,7 @@ async fn io_loop(
+     listener2: TcpListener,
+     listener_console: Option<TcpListener>,
+     key: &str,
++    policy: &PolicyClient,
+ ) {
+     check_params();
+     let limiter = <Limiter>::new(TOTAL_BANDWIDTH.load(Ordering::SeqCst) as _);
+@@ -347,7 +359,7 @@ async fn io_loop(
+                 match res {
+                     Ok((stream, addr))  => {
+                         stream.set_nodelay(true).ok();
+-                        handle_connection(stream, addr, &limiter, key, false).await;
++                        handle_connection(stream, addr, &limiter, key, policy, false).await;
+                     }
+                     Err(err) => {
+                        log::error!("listener.accept failed: {}", err);
+@@ -359,7 +371,7 @@ async fn io_loop(
+                 match res {
+                     Ok((stream, addr))  => {
+                         stream.set_nodelay(true).ok();
+-                        handle_connection(stream, addr, &limiter, key, true).await;
++                        handle_connection(stream, addr, &limiter, key, policy, true).await;
+                     }
+                     Err(err) => {
+                        log::error!("listener2.accept failed: {}", err);
+@@ -371,7 +383,7 @@ async fn io_loop(
+                 match res {
+                     Ok((stream, addr))  => {
+                         stream.set_nodelay(true).ok();
+-                        handle_connection(stream, addr, &limiter, key, false).await;
++                        handle_connection(stream, addr, &limiter, key, policy, false).await;
+                     }
+                     Err(err) => {
+                        log::error!("console listener.accept failed: {}", err);
+@@ -388,6 +400,7 @@ async fn handle_connection(
+     addr: SocketAddr,
+     limiter: &Limiter,
+     key: &str,
++    policy: &PolicyClient,
+     ws: bool,
+ ) {
+     let ip = hbb_common::try_into_v4(addr).ip();
+@@ -411,9 +424,10 @@ async fn handle_connection(
+         return;
+     }
+     let key = key.to_owned();
++    let policy = policy.clone();
+     let limiter = limiter.clone();
+     tokio::spawn(async move {
+-        allow_err!(make_pair(stream, addr, &key, limiter, ws).await);
++        allow_err!(make_pair(stream, addr, &key, limiter, &policy, ws).await);
+     });
+ }
+ 
+@@ -422,6 +436,7 @@ async fn make_pair(
+     mut addr: SocketAddr,
+     key: &str,
+     limiter: Limiter,
++    policy: &PolicyClient,
+     ws: bool,
+ ) -> ResultType<()> {
+     if ws {
+@@ -451,14 +466,14 @@ async fn make_pair(
+             Ok(response)
+         };
+         let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+-        make_pair_(ws_stream, addr, key, limiter).await;
++        make_pair_(ws_stream, addr, key, limiter, policy).await;
+     } else {
+-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
++        make_pair_(FramedStream::from(stream, addr), addr, key, limiter, policy).await;
+     }
+     Ok(())
+ }
+ 
+-async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
++async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter, policy: &PolicyClient) {
+     let mut stream = stream;
+     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
+         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+@@ -467,6 +482,10 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
+                     log::warn!("Relay authentication failed from {} - invalid key", addr);
+                     return;
+                 }
++                if !policy.allow(&rf.id, "relay", &addr.ip().to_string()).await {
++                    log::warn!("Relay denied for {} from {}", rf.id, addr);
++                    return;
++                }
+                 if !rf.uuid.is_empty() {
+                     let mut peer = PEERS.lock().await.remove(&rf.uuid);
+                     if let Some(peer) = peer.as_mut() {
+@@ -478,13 +497,15 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
+                             stream.set_raw();
+                             log::info!("Both are raw");
+                         }
+-                        if let Err(err) = relay(addr, &mut stream, peer, limiter, id.clone()).await
++                        policy.event_with_session("relay_start", &rf.id, &addr.ip().to_string(), "relay-paired", Some(&rf.uuid));
++                        if let Err(err) = relay(addr, &mut stream, peer, limiter, id.clone(), &rf.uuid).await
+                         {
+                             log::info!("Relay of {} closed: {}", addr, err);
+                         } else {
+                             log::info!("Relay of {} closed", addr);
+                         }
+                         USAGE.write().await.remove(&id);
++                        policy.event_with_session("relay_end", &rf.id, &addr.ip().to_string(), "relay-closed", Some(&rf.uuid));
+                     } else {
+                         log::info!("New relay request {} from {}", rf.uuid, addr);
+                         PEERS.lock().await.insert(rf.uuid.clone(), Box::new(stream));
+@@ -503,6 +524,7 @@ async fn relay(
+     peer: &mut Box<dyn StreamTrait>,
+     total_limiter: Limiter,
+     id: String,
++    session_key: &str,
+ ) -> ResultType<()> {
+     let ip = addr.ip().to_string();
+     let mut tm = std::time::Instant::now();
+@@ -560,6 +582,9 @@ async fn relay(
+                 }
+             },
+             _ = timer.tick() => {
++                if TERMINATED.write().await.remove(session_key) {
++                    bail!("Terminated by control plane");
++                }
+                 if last_recv_time.elapsed().as_secs() > 30 {
+                     bail!("Timeout");
+                 }
+diff --git a/src/rendezvous_server.rs b/src/rendezvous_server.rs
+index eaf7190..c7ba2f5 100644
+--- a/src/rendezvous_server.rs
++++ b/src/rendezvous_server.rs
+@@ -1,5 +1,6 @@
+ use crate::common::*;
+ use crate::peer::*;
++use crate::policy::PolicyClient;
+ use hbb_common::{
+     allow_err, bail,
+     bytes::{Bytes, BytesMut},
+@@ -77,6 +78,7 @@ struct Inner {
+     mask: Option<Ipv4Network>,
+     local_ip: String,
+     sk: Option<sign::SecretKey>,
++    policy: PolicyClient,
+ }
+ 
+ #[derive(Clone)]
+@@ -149,6 +151,7 @@ impl RendezvousServer {
+                 sk,
+                 mask,
+                 local_ip,
++                policy: PolicyClient::from_env(),
+             }),
+         };
+         log::info!("mask: {:?}", rs.inner.mask);
+@@ -355,6 +358,11 @@ impl RendezvousServer {
+                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                     // B registered
+                     if !rp.id.is_empty() {
++                        if !self.inner.policy.allow(&rp.id, "register", &addr.ip().to_string()).await {
++                            log::warn!("Registration denied for {} from {}", rp.id, addr);
++                            return Ok(());
++                        }
++                        self.inner.policy.event("device_register", &rp.id, &addr.ip().to_string(), "register-peer");
+                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
+                         self.update_addr(rp.id, addr, socket).await?;
+                         if self.inner.serial > rp.serial {
+@@ -374,6 +382,9 @@ impl RendezvousServer {
+                     }
+                     let id = rk.id;
+                     let ip = addr.ip().to_string();
++                    if !self.inner.policy.allow(&id, "register", &ip).await {
++                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
++                    }
+                     if id.len() < 6 {
+                         return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                     } else if !self.check_ip_blocker(&ip, &id).await {
+@@ -524,6 +535,16 @@ impl RendezvousServer {
+                     if let Some(sink) = sink.take() {
+                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                     }
++                    if !self.inner.policy.allow(&rf.id, "connect", &addr.ip().to_string()).await {
++                        let mut msg_out = RendezvousMessage::new();
++                        msg_out.set_relay_response(RelayResponse {
++                            refuse_reason: "Connection denied by control plane".to_owned(),
++                            ..Default::default()
++                        });
++                        Self::send_to_sink(sink, msg_out).await;
++                        return false;
++                    }
++                    self.inner.policy.event("connection_request", &rf.id, &addr.ip().to_string(), "request-relay");
+                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                         let mut msg_out = RendezvousMessage::new();
+                         rf.socket_addr = AddrMangle::encode(addr).into();
+@@ -537,6 +558,9 @@ impl RendezvousServer {
+                     let addr_b = AddrMangle::decode(&rr.socket_addr);
+                     rr.socket_addr = Default::default();
+                     let id = rr.id();
++                    if !self.inner.policy.allow(id, "connect", &addr.ip().to_string()).await {
++                        return false;
++                    }
+                     if !id.is_empty() {
+                         let pk = self.get_pk(&rr.version, id.to_owned()).await;
+                         rr.set_pk(pk);
+@@ -724,6 +748,19 @@ impl RendezvousServer {
+         // because punch hole won't work if in the same intranet,
+         // all routers will drop such self-connections.
+         if let Some(peer) = self.pm.get(&id).await {
++            let decision = self.inner.policy.decision(&id, "connect", &addr.ip().to_string()).await;
++            if !decision.allowed {
++                let mut msg_out = RendezvousMessage::new();
++                msg_out.set_punch_hole_response(PunchHoleResponse {
++                    other_failure: "Connection denied by control plane".to_owned(),
++                    ..Default::default()
++                });
++                return Ok((msg_out, None));
++            }
++            if decision.force_relay {
++                ph.nat_type = NatType::SYMMETRIC.into();
++            }
++            self.inner.policy.event("connection_request", &id, &addr.ip().to_string(), "punch-hole");
+             let (elapsed, peer_addr) = {
+                 let r = peer.read().await;
+                 (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)

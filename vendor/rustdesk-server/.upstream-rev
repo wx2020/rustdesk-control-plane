@@ -1,0 +1,16 @@
+{
+  "upstreamRepository": "https://github.com/rustdesk/rustdesk-server.git",
+  "baseTag": "1.1.17",
+  "baseCommit": "a7736be5e40f85bfc141120dce587e836e5d4b80",
+  "patchedAt": "2026-09-21T15:34:25Z",
+  "patchVersion": "v1.0.0",
+  "patches": [
+    "patches/rustdesk-server/0001-control-plane-policy.patch"
+  ],
+  "touchedFiles": [
+    "src/lib.rs",
+    "src/policy.rs",
+    "src/relay_server.rs",
+    "src/rendezvous_server.rs"
+  ]
+}

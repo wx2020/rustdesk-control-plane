@@ -144,12 +144,98 @@ POST /api/admin/sessions/:id/terminate
 
 该操作向 `hbbr` loopback console 发送 `disconnect <sessionKey>`，Relay 循环将在下一个检查周期关闭会话。它不能断开直连会话。只有使用本仓库改造版 `hbbr` 并完成 Rust 互操作验证后，才能作为生产断开流程使用。
 
-## 9. 上游同步
+## 9. 服务端代码上游同步 SOP
 
-每次同步 `vendor/rustdesk-server` 前：
+本项目采用“标准 Patch 资产（`patches/`）+ 上游版本元数据（`vendor/rustdesk-server/.upstream-rev`）+ 跨平台同步工具”的工作流体系。
 
-1. 记录上游标签、提交 ID 和本仓库策略补丁列表。
-2. 重点复核 `rendezvous_server.rs` 的注册、Punch Hole、Request Relay 路径，以及 `relay_server.rs` 的配对与控制台路径。
-3. 重新应用并审查 `policy.rs`、缓存/熔断、事件重试和 Relay 断开逻辑。
-4. 在隔离环境执行 Rust 构建、控制面测试、官方客户端和 fail-open/fail-closed 互操作测试。
-5. 评审 AGPL-3.0 上游义务和本仓库 MIT 新增代码边界后再发布。
+### 9.1 版本状态感知与日常检查
+
+执行检查命令确认当前基准与上游官方仓库的差异：
+
+```bash
+npm run sync:server:check
+```
+
+- 若输出“一致”，说明当前无新提交或已在最新基线；
+- 若提示“上游有新提交”，记录官方 Release Tag 或提交 Commit。
+
+### 9.2 预演合并（Dry-Run）
+
+在落地修改前，首先针对目标版本进行无副作用的冲突探测：
+
+```bash
+# 针对默认上游最新 HEAD 预演
+npm run sync:server:apply -- --dry-run
+
+# 或指定具体 Tag / Commit 预演
+npm run sync:server:apply -- --target=1.1.18 --dry-run
+```
+
+- **通过**：表示 `patches/rustdesk-server/0001-control-plane-policy.patch` 与新代码完全兼容；
+- **失败**：终端会输出发生冲突的源码文件及行号，需进入人工审查流程。
+
+### 9.3 执行同步与冲突消解
+
+若预演通过，执行正式同步：
+
+```bash
+npm run sync:server:apply -- --target=<version-or-commit>
+```
+
+该命令会自动拉取上游源码、应用补丁、同步更新 `vendor/rustdesk-server/` 并更新 `.upstream-rev`。
+
+**冲突消解重点关注锚点**：
+1. `src/rendezvous_server.rs`：
+   - `Inner` 结构体中的 `policy: PolicyClient` 字段及其构造函数注入；
+   - `RegisterPeer` 与 `RegisterPk` 设备注册流程中的 `allow(&rp.id, "register", ...)`；
+   - `PunchHole` 直连协商与 `RequestRelay` 中继协商入口。
+2. `src/relay_server.rs`：
+   - `make_pair_` 中的 `allow(&rf.id, "relay", ...)` 校验与 `relay_start/relay_end` 事件上报；
+   - `check_cmd` 控制台 listener 中的 `disconnect(d) <relay-uuid>` 命令处理与 `TERMINATED` 标记。
+3. 若修改了服务端策略适配代码，通过以下命令重新导出补丁资产：
+   ```bash
+   npm run sync:server:export
+   ```
+
+### 9.4 验证门禁与回滚机制
+
+完成合并后，必须依次完成以下 4 级验证门禁：
+
+1. **L1 静态与单元验证**：
+   - 补丁应用校验：`npm run sync:server:apply -- --dry-run`
+   - Node 控制面单测：`npm test`
+   - Rust 编译检查：`cargo check --manifest-path vendor/rustdesk-server/Cargo.toml`
+2. **L2 策略模式集成验证**：
+   - 验证无 `CONTROL_PLANE_URL` 下原生通信正常；
+   - 验证 `CONTROL_PLANE_ENFORCE=Y` 下未授权设备的连接拒绝；
+   - 验证超时与熔断（`CONTROL_PLANE_CACHE_TTL` 与 `CONTROL_PLANE_CIRCUIT_OPEN_FOR`）。
+3. **L3 官方客户端回归**：
+   - 至少选用一个受支持官方客户端（如 1.2.x 或 1.3.x）完成端到端远程桌面连接演练。
+4. **回滚预案（Rollback）**：
+   - 若线上或联调发现破坏性协议问题，通过 Git 回滚当前更新提交：
+     ```bash
+     git checkout HEAD~1 -- vendor/rustdesk-server .upstream-rev patches/
+     ```
+
+### 9.5 开源许可与 AGPL-3.0 合规声明
+
+- 上游 `rustdesk-server` 基于 AGPL-3.0 协议；
+- 本项目管理后台 `admin/` 保持独立进程，采用 MIT 协议；
+- 构建与部署包含补丁的服务端二进制时，必须保证 `patches/` 与改造后源码随构建制品透明可查，符合 AGPL 网络交互源代码披露要求。
+
+### 9.6 远端 GitHub Actions 自动化工作流同步
+
+项目配置了 [.github/workflows/upstream-sync.yml](../.github/workflows/upstream-sync.yml) 远端自动化同步工作流，支持无人值守与人工点播两种模式：
+
+1. **定时自动同步与 PR 生成**：
+   - 每周一 UTC 00:00 自动触发；
+   - 检查上游是否有新版本，若有更新且补丁兼容，自动跑通 `npm test` 与 `cargo check`，并创建带有完整验证报告的 Pull Request（分支 `upstream-sync/<target>`）；
+   - 若存在合并冲突，自动在 GitHub 仓库中创建 Issue 告警并附带冲突详情日志。
+2. **手动点播同步（workflow_dispatch）**：
+   - 进入 GitHub 仓库 Actions -> 选择 `Upstream Sync & PR Automation` -> 点击 **Run workflow**；
+   - **参数配置**：
+     - `target`：输入目标 Tag（如 `1.1.18`）或 Commit Hash，留空则默认同步上游 `master` 最新提交；
+     - `dry_run`：勾选则仅进行兼容性与编译预演，不创建 PR；
+     - `create_pr`：是否在测试通过后自动发起 Pull Request。
+
+

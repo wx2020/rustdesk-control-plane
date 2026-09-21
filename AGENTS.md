@@ -24,7 +24,11 @@
   - `backup.sh` / `restore.sh`：`npm run backup` / `npm run restore`（restore 需 `RESTORE_CONFIRM=Y`）
   - `postgres.test.js`：需 `TEST_DATABASE_URL`，否则跳过
   - `public/`：中文单页控制台（原生 HTML/CSS/JS，无框架），2026-09-21 已产品化改版：首屏三轨状态（控制面/通信面/审批队列）、状态色体系、响应式布局、去重后的单文件 styles.css
-- `docs/`：`IMPLEMENTATION-TODO.md`（单一 P0→P1→P2 优先级 + 四级状态定义）、`OPERATIONS-RUNBOOK.md`、`SE-ARCHITECTURE.md`
+- `patches/`：`patches/rustdesk-server/0001-control-plane-policy.patch` 标准 Patch 资产
+- `scripts/`：`scripts/sync-server.js` 跨平台上游同步与补丁管理工具（`npm run sync:server:check` / `sync:server:apply` / `sync:server:export`）
+- `.github/workflows/upstream-sync.yml`：上游定时版本探测与补丁门禁自动化工作流
+- `vendor/rustdesk-server/.upstream-rev`：上游基准仓库、Commit、Tag 与 Patch 映射清单
+- `docs/`：`IMPLEMENTATION-TODO.md`（单一 P0→P1→P2 优先级 + 四级状态定义）、`OPERATIONS-RUNBOOK.md`（含第9节上游同步 SOP）、`SE-ARCHITECTURE.md`
 
 ## 核心机制
 

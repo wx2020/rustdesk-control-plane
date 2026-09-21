@@ -9,7 +9,10 @@
     "test": "node --test admin/*.test.js",
     "test:postgres": "TEST_DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:54329/rustdesk_control_test node --test admin/postgres.test.js",
     "backup": "bash admin/backup.sh",
-    "restore": "bash admin/restore.sh"
+    "restore": "bash admin/restore.sh",
+    "sync:server:check": "node scripts/sync-server.js check",
+    "sync:server:apply": "node scripts/sync-server.js apply",
+    "sync:server:export": "node scripts/sync-server.js export-patch"
   },
   "dependencies": {
     "pg": "^8.13.1"
