@@ -1,3 +1,14 @@
+diff --git a/src/hbbr.rs b/src/hbbr.rs
+index e6763fa..25eef94 100644
+--- a/src/hbbr.rs
++++ b/src/hbbr.rs
+@@ -1,5 +1,6 @@
+ use clap::App;
+ mod common;
++mod policy;
+ mod relay_server;
+ use flexi_logger::*;
+ use hbb_common::{config::RELAY_PORT, ResultType};
 diff --git a/src/lib.rs b/src/lib.rs
 index 8da29a2..212b8d0 100644
 --- a/src/lib.rs

@@ -9,6 +9,7 @@
   ],
   "touchedFiles": [
     "src/lib.rs",
+    "src/hbbr.rs",
     "src/policy.rs",
     "src/relay_server.rs",
     "src/rendezvous_server.rs"
