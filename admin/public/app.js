@@ -80,11 +80,20 @@ function render(data) {
   $('#hero-status').textContent = running === 2 ? '所有通信服务正在运行' : available ? '通信服务等待启动' : '尚未发现通信服务二进制';
   $('#service-grid').innerHTML = data.services.map(serviceCard).join('');
   const config = data.config;
-  $('#config-grid').innerHTML = [
+  const configItems = [
     ['服务端源码', config.serverRoot], ['运行目录', config.runtimeRoot], ['Relay 地址', config.relayAddress],
     ['hbbs / UDP', `${config.ports.hbbs} / ${config.ports.hbbs}`], ['hbbr / TCP', config.ports.hbbr],
     ['数据库', config.database.exists ? `${config.database.path} (${config.database.size} B)` : `${config.database.path}（尚未创建）`],
-  ].map(([label, value]) => `<div class="config-item"><span>${label}</span><code>${escapeHtml(value)}</code></div>`).join('');
+  ];
+  if (config.oauth) {
+    configItems.push(
+      ['OAuth 2.0 / SSO', config.oauth.enabled ? `已启用 (${config.oauth.providerName})` : '未启用 (通过环境变量配置)'],
+      ['OAuth 回调地址', config.oauth.redirectUri],
+      ['OAuth 身份源 (Issuer)', config.oauth.issuer],
+      ['OAuth 客户端 ID', config.oauth.clientId]
+    );
+  }
+  $('#config-grid').innerHTML = configItems.map(([label, value]) => `<div class="config-item"><span>${label}</span><code>${escapeHtml(value)}</code></div>`).join('');
   $('#last-sync').textContent = `最近同步 ${new Date().toLocaleTimeString()}`;
   document.querySelectorAll('[data-action]').forEach((button) => button.addEventListener('click', serviceAction));
   document.querySelectorAll('[data-console]').forEach((button) => button.addEventListener('click', () => openConsole(button.dataset.console)));

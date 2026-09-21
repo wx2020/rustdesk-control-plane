@@ -192,6 +192,13 @@ function readConfig() {
     idServerAddress: ID_SERVER_ADDRESS,
     publicKey: readPublicKey(),
     database,
+    oauth: {
+      enabled: oauth.isEnabled(),
+      providerName: oauth.getProviderName(),
+      issuer: process.env.OAUTH_ISSUER || '未配置',
+      clientId: oauth.getClientId() || '未配置',
+      redirectUri: resolveRedirectUri({ headers: {} }),
+    },
     sourceRepositories: [
       { name: 'rustdesk-server', path: path.join(ROOT, 'vendor/rustdesk-server'), role: '官方 hbbs / hbbr / rustdesk-utils' },
       { name: 'rustdesk-server-demo', path: path.join(ROOT, 'vendor/rustdesk-server-demo'), role: '极简服务端示例' },
