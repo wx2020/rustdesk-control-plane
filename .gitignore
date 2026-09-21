@@ -11,4 +11,6 @@ vendor/*/.env.local
 !*.env.example
 *.dump
 *.backup
+!vendor/rustdesk-server/.env
+!vendor/rustdesk-server/db_v2.sqlite3
 .DS_Store

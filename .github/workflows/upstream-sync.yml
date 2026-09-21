@@ -85,6 +85,8 @@ jobs:
 
       - name: Cargo check on patched server
         if: steps.decision.outputs.should_sync == 'true'
+        env:
+          DATABASE_URL: sqlite://${{ github.workspace }}/vendor/rustdesk-server/db_v2.sqlite3
         run: cargo check --manifest-path vendor/rustdesk-server/Cargo.toml
 
       - name: Install Node dependencies

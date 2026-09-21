@@ -31,5 +31,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cargo check on patched server
+        env:
+          DATABASE_URL: sqlite://${{ github.workspace }}/vendor/rustdesk-server/db_v2.sqlite3
         run: cargo check --manifest-path vendor/rustdesk-server/Cargo.toml
 
